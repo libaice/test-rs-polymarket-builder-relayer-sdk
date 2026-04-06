@@ -1,0 +1,16 @@
+[package]
+name = "test-relayer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rs-builder-relayer-client = { git = "https://github.com/OrderBookTrade/rs-builder-relayer-client", branch = "main" }
+polymarket-client-sdk = { version = "0.4", features = ["data"] }
+tokio = { version = "1", features = ["full"] }
+ethers = { version = "2", features = ["abigen"] }
+dotenvy = "0.15"
+anyhow = "1"
+hex = "0.4"
+rust_decimal = "1.36"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
