@@ -88,10 +88,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ── 3. Filter settled (redeemable) positions ────────────────────────
 
-    println!("\n{:=<70}", "= POSITIONS ");
+    println!("\n{:=<150}", "= POSITIONS ");
     println!(
-        "  {:<3} {:<40} {:<6} {:<10} {:<8} {}",
-        "#", "Market", "Side", "Shares", "Status", "Value"
+        "  {:<3} {:<40} {:<6} {:<10} {:<8} {:<66} {}",
+        "#", "Market", "Side", "Shares", "Status", "Condition ID", "Value"
     );
 
     let mut redeemable = Vec::new();
@@ -112,9 +112,17 @@ async fn main() -> anyhow::Result<()> {
             ("ACTIVE", format!("~${:.2}", pos.current_value))
         };
 
+        let cid_hex = format!("0x{}", hex::encode(pos.condition_id));
+
         println!(
-            "  {:<3} {:<40} {:<6} {:<10} {:<8} {}",
-            i + 1, title, pos.outcome, pos.size, status, value,
+            "  {:<3} {:<40} {:<6} {:<10} {:<8} {:<66} {}",
+            i + 1,
+            title,
+            pos.outcome,
+            pos.size,
+            status,
+            cid_hex,
+            value,
         );
 
         if pos.redeemable {
