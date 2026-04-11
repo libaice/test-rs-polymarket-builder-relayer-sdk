@@ -5,6 +5,7 @@
 //!   cargo run -- --execute     # actually redeem
 
 use ethers::signers::LocalWallet;
+use ethers::types::Address;
 use polymarket_client_sdk::data::Client as DataClient;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_relayer::{
@@ -55,13 +56,34 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let wallet: LocalWallet = private_key.parse()?;
-    let client = RelayClient::new(137, wallet.clone(), auth, RelayerTxType::Safe).await?;
-    let direct = DirectExecutor::new(&rpc_url, wallet, 137)?;
+
+    // Wallet type: 0=EOA, 1=Proxy (magic.link), 2=Safe (default)
+    let sig_type: u8 = env::var("SIGNATURE_TYPE")
+        .unwrap_or_else(|_| "2".to_string())
+        .parse()
+        .unwrap_or(2);
+    let tx_type = RelayerTxType::from_signature_type(sig_type)
+        .unwrap_or_else(|| {
+            eprintln!("[warn] Unknown SIGNATURE_TYPE={sig_type}, defaulting to Safe (2)");
+            RelayerTxType::Safe
+        });
+
+    let mut client = RelayClient::new(137, wallet.clone(), auth, tx_type).await?;
+    // Read nonce from on-chain — relayer API returns stale nonce (0) causing GS026
+    client.set_rpc_url(rpc_url.clone());
+
+    let direct = match tx_type {
+        RelayerTxType::Proxy => {
+            let proxy_addr: Address = wallet_address.parse()?;
+            DirectExecutor::new_proxy_with_address(&rpc_url, wallet, 137, proxy_addr)?
+        }
+        _ => DirectExecutor::with_type(&rpc_url, wallet, 137, tx_type)?,
+    };
     let matic = direct.get_matic_balance().await.unwrap_or(0.0);
 
-    println!("[info] EOA:   {:?}", client.signer_address());
-    println!("[info] Safe:  {:?}", client.wallet_address()?);
-    println!("[info] MATIC: {:.4}", matic);
+    println!("[info] EOA:    {:?}", client.signer_address());
+    println!("[info] Wallet: {:?} ({})", client.wallet_address()?, tx_type.as_str());
+    println!("[info] MATIC:  {:.4}", matic);
 
     // ── 2. Fetch all positions ──────────────────────────────────────────
 
@@ -191,31 +213,36 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             Err(RelayerError::QuotaExhausted) => {
-                println!("  [429]  {} — relayer quota hit, falling back to direct", title);
+                println!("  [429]  {} — relayer quota hit", title);
             }
             Err(e) => {
-                println!("  [WARN] {} — relayer error: {}, trying direct", title, e);
+                println!("  [WARN] {} — relayer error: {} — trying direct", title, e);
             }
         }
 
-        // Fallback: direct on-chain
-        match direct.execute(&tx).await {
-            Ok(r) if r.success => {
-                gas_spent += r.gas_cost_matic;
-                println!(
-                    "  [OK]   {:<40} | {} | {} | direct | gas: {:.5} MATIC | tx: {}",
-                    title, usdc_label, kind, r.gas_cost_matic, short_hash(&r.tx_hash),
-                );
-                success += 1;
+        // Direct on-chain fallback (Safe only — Proxy wallets can't be called directly)
+        if tx_type == RelayerTxType::Safe {
+            match direct.execute(&tx).await {
+                Ok(r) if r.success => {
+                    gas_spent += r.gas_cost_matic;
+                    println!(
+                        "  [OK]   {:<40} | {} | {} | direct | gas: {:.5} MATIC | tx: {}",
+                        title, usdc_label, kind, r.gas_cost_matic, short_hash(&r.tx_hash),
+                    );
+                    success += 1;
+                }
+                Ok(r) => {
+                    println!("  [FAIL] {} | reverted | tx: {}", title, short_hash(&r.tx_hash));
+                    failed += 1;
+                }
+                Err(e) => {
+                    println!("  [FAIL] {} | {}", title, e);
+                    failed += 1;
+                }
             }
-            Ok(r) => {
-                println!("  [FAIL] {} | reverted | tx: {}", title, short_hash(&r.tx_hash));
-                failed += 1;
-            }
-            Err(e) => {
-                println!("  [FAIL] {} | {}", title, e);
-                failed += 1;
-            }
+        } else {
+            println!("  [SKIP] {} — direct fallback not available for {} wallets", title, tx_type.as_str());
+            failed += 1;
         }
     }
 
