@@ -24,8 +24,20 @@ List all your current positions and identify WON markets without sending any tra
 cargo run
 ```
 
-### Execute Redemption
-Batch redeem all winning positions through the relayer:
+### Execute Redemption (Sequential Mode - Recommended)
+By default, executing will sequentially redeem your winning positions one by one with a 5-second delay. This prevents relayer queue bottlenecks (especially for Proxy wallets) and features an **automatic "Direct" fallback** if the gasless endpoint fails.
 ```bash
 cargo run -- --execute
+```
+
+You can customize the delay:
+```bash
+cargo run -- --execute --delay 8
+```
+
+### Execute Redemption (Batch Mode)
+Merge all redeems into a single gasless API request.
+> ⚠️ **Warning**: Do not use this for Proxy wallets if you have more than 2 conditions due to the relayer's internal tight gas limit overhead.
+```bash
+cargo run -- --execute --batch
 ```
