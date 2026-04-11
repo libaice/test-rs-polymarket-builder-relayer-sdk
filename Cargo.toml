@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rs-builder-relayer-client = { path = "../rs-builder-relayer-client" }
+rs-builder-relayer-client = { git = "https://github.com/OrderBookTrade/rs-builder-relayer-client", branch = "fix/base64" }
 polymarket-client-sdk = { version = "0.4", features = ["data"] }
 tokio = { version = "1", features = ["full"] }
 ethers = { version = "2", features = ["abigen"] }
