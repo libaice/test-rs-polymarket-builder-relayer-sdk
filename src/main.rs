@@ -1,19 +1,22 @@
 //! Test script: query all settled Polymarket positions and batch redeem them.
 //!
 //! Usage:
-//!   cargo run                  # dry-run (list positions only)
-//!   cargo run -- --execute     # actually redeem
+//!   cargo run                          # dry-run (list positions only)
+//!   cargo run -- --execute             # sequential redeem (default, 5s delay)
+//!   cargo run -- --execute --batch     # batch all into one relay request
+//!   cargo run -- --execute --delay 8   # sequential with custom delay
 
 use ethers::signers::LocalWallet;
 use ethers::types::Address;
 use polymarket_client_sdk::data::Client as DataClient;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_relayer::{
-    operations, AuthMethod, DirectExecutor, RelayClient, RelayerError, RelayerTxType, Transaction,
+    operations, AuthMethod, DirectExecutor, RelayClient, RelayerTxType, Transaction,
 };
 use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::env;
+use tokio::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +29,15 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = dotenvy::dotenv();
 
-    let execute = env::args().any(|a| a == "--execute");
+    // ── Parse CLI args ─────────────────────────────────────────────────
+    let args: Vec<String> = env::args().collect();
+    let execute = args.iter().any(|a| a == "--execute");
+    let batch_mode = args.iter().any(|a| a == "--batch");
+    let delay_secs: u64 = args.iter()
+        .position(|a| a == "--delay")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
 
     // ── 1. Load keys & build clients ────────────────────────────────────
 
@@ -69,7 +80,6 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let mut client = RelayClient::new(137, wallet.clone(), auth, tx_type).await?;
-    // Read nonce from on-chain — relayer API returns stale nonce (0) causing GS026
     client.set_rpc_url(rpc_url.clone());
 
     let direct = match tx_type {
@@ -81,9 +91,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let matic = direct.get_matic_balance().await.unwrap_or(0.0);
 
+    let mode_str = if batch_mode { "batch".to_string() } else { format!("sequential ({}s delay)", delay_secs) };
     println!("[info] EOA:    {:?}", client.signer_address());
     println!("[info] Wallet: {:?} ({})", client.wallet_address()?, tx_type.as_str());
     println!("[info] MATIC:  {:.4}", matic);
+    println!("[info] Mode:   {}", mode_str);
 
     // ── 2. Fetch all positions ──────────────────────────────────────────
 
@@ -138,13 +150,7 @@ async fn main() -> anyhow::Result<()> {
 
         println!(
             "  {:<3} {:<40} {:<6} {:<10} {:<8} {:<66} {}",
-            i + 1,
-            title,
-            pos.outcome,
-            pos.size,
-            status,
-            cid_hex,
-            value,
+            i + 1, title, pos.outcome, pos.size, status, cid_hex, value,
         );
 
         if pos.redeemable {
@@ -154,8 +160,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!(
         "\n  Redeemable: {} | Expected USDC: ~${:.2}\n",
-        redeemable.len(),
-        expected_usdc,
+        redeemable.len(), expected_usdc,
     );
 
     if redeemable.is_empty() {
@@ -168,113 +173,127 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // ── 4. Batch redeem all settled positions ───────────────────────────
-
-    println!("{:=<70}", "= REDEEMING ");
+    // ── 4. Build redeem transactions (deduplicate by condition_id) ──────
 
     let mut seen_conditions = HashSet::new();
-    let mut success = 0u32;
-    let mut failed = 0u32;
-    let mut gas_spent = 0.0f64;
+    let mut redeem_txs: Vec<(String, String, Transaction)> = Vec::new(); // (title, kind, tx)
 
     for pos in &redeemable {
         let cid_hex = format!("0x{}", hex::encode(pos.condition_id));
-
-        // Each condition_id only needs to be redeemed once (covers both outcomes)
         if !seen_conditions.insert(cid_hex.clone()) {
             continue;
         }
 
         let title = truncate(&pos.title, 38);
-        let cid_bytes: [u8; 32] = *pos.condition_id;
-        let won = pos.cur_price >= Decimal::new(95, 2);
         let kind = if pos.negative_risk { "NegRisk" } else { "CTF" };
-
+        let cid_bytes: [u8; 32] = *pos.condition_id;
         let tx = if pos.negative_risk {
             operations::redeem_neg_risk_positions(cid_bytes, &[1, 2])
         } else {
             operations::redeem_regular(cid_bytes, &[1, 2])
         };
+        redeem_txs.push((title, kind.to_string(), tx));
+    }
 
-        let usdc_label = if won {
-            format!("+${:.2}", pos.size)
-        } else {
-            "$0.00".into()
-        };
+    let total = redeem_txs.len();
+    println!("{:=<70}", format!("= REDEEMING {} [{}] ", total, if batch_mode { "batch" } else { "sequential" }));
 
-        // Try gasless relayer first
-        match try_relayer(&client, &tx, &pos.title).await {
-            Ok(hash) => {
-                println!(
-                    "  [OK]   {:<40} | {} | {} | gasless | tx: {}",
-                    title, usdc_label, kind, short_hash(&hash),
-                );
-                success += 1;
-                continue;
-            }
-            Err(RelayerError::QuotaExhausted) => {
-                println!("  [429]  {} — relayer quota hit", title);
+    // ── 5a. Batch mode: single relay request ───────────────────────────
+
+    if batch_mode {
+        let txs: Vec<Transaction> = redeem_txs.iter().map(|(_, _, tx)| tx.clone()).collect();
+
+        match client.execute_batch(txs, "Batch redeem all").await {
+            Ok(result) => {
+                let hash = result.tx_hash.as_deref().unwrap_or("unknown");
+                println!("  [OK]   Batch redeemed {} condition(s) | tx: {}", total, short_hash(hash));
+                for (t, k, _) in &redeem_txs {
+                    println!("         - {} ({})", t, k);
+                }
+                println!("\n{:=<70}", "= SUMMARY ");
+                println!("  Redeemed: {total}/{total} condition(s)");
             }
             Err(e) => {
-                println!("  [WARN] {} — relayer error: {} — trying direct", title, e);
+                println!("  [FAIL] Batch failed: {}", e);
+                println!("         Try without --batch (sequential mode) instead.");
+                println!("\n{:=<70}", "= SUMMARY ");
+                println!("  Redeemed: 0/{total} condition(s)");
+                println!("  Failed:   1");
             }
         }
+        println!("  Expected USDC: ~${:.2}", expected_usdc);
+        return Ok(());
+    }
 
-        // Direct on-chain fallback (Safe only — Proxy wallets can't be called directly)
-        if tx_type == RelayerTxType::Safe {
-            match direct.execute(&tx).await {
-                Ok(r) if r.success => {
-                    gas_spent += r.gas_cost_matic;
-                    println!(
-                        "  [OK]   {:<40} | {} | {} | direct | gas: {:.5} MATIC | tx: {}",
-                        title, usdc_label, kind, r.gas_cost_matic, short_hash(&r.tx_hash),
-                    );
-                    success += 1;
-                }
-                Ok(r) => {
-                    println!("  [FAIL] {} | reverted | tx: {}", title, short_hash(&r.tx_hash));
-                    failed += 1;
+    // ── 5b. Sequential mode: one-at-a-time with wait and fallback ──────
+
+    let mut successful = 0;
+    let mut failed = 0;
+
+    // Proxy wallets can only use gasless — direct fallback is not available
+    // (proxy contract requires msg.sender == factory, not EOA)
+    let can_direct = tx_type == RelayerTxType::Safe;
+
+    for (i, (title, kind, tx)) in redeem_txs.iter().enumerate() {
+        println!("\n[{} / {}] Redeeming: {} ({})", i + 1, total, title, kind);
+
+        let txs = vec![tx.clone()];
+        let gasless_result = match client.execute(txs, title).await {
+            Ok(handle) => match handle.wait().await {
+                Ok(result) => {
+                    let hash = result.tx_hash.as_deref().unwrap_or("unknown");
+                    println!("  [OK]   gasless | tx: {}", short_hash(hash));
+                    successful += 1;
+                    true
                 }
                 Err(e) => {
-                    println!("  [FAIL] {} | {}", title, e);
-                    failed += 1;
+                    println!("  [WARN] Relayer tx failed: {}", e);
+                    false
                 }
+            },
+            Err(e) => {
+                println!("  [WARN] Relayer API error: {}", e);
+                false
             }
-        } else {
-            println!("  [SKIP] {} — direct fallback not available for {} wallets", title, tx_type.as_str());
-            failed += 1;
+        };
+
+        // Direct fallback (Safe only — Proxy wallets cannot be called directly)
+        if !gasless_result {
+            if can_direct {
+                println!("  ... falling back to direct on-chain (MATIC gas)");
+                match direct.execute(tx).await {
+                    Ok(res) => {
+                        println!("  [OK]   direct | gas: {:.5} MATIC | tx: {}", res.gas_cost_matic, short_hash(&res.tx_hash));
+                        successful += 1;
+                    }
+                    Err(err) => {
+                        println!("  [FAIL] Direct also failed: {}", err);
+                        failed += 1;
+                    }
+                }
+            } else {
+                println!("  [FAIL] No fallback for {} wallets — gasless is the only path", tx_type.as_str());
+                failed += 1;
+            }
+        }
+
+        if i + 1 < total {
+            println!("  Waiting {}s before next...", delay_secs);
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
         }
     }
 
-    // ── 5. Summary ──────────────────────────────────────────────────────
-
     println!("\n{:=<70}", "= SUMMARY ");
-    println!("  Redeemed: {success}/{} condition(s)", seen_conditions.len());
+    println!("  Redeemed: {}/{} condition(s)", successful, total);
     if failed > 0 {
-        println!("  Failed:   {failed}");
+        println!("  Failed:   {}", failed);
     }
     println!("  Expected USDC: ~${:.2}", expected_usdc);
-    if gas_spent > 0.0 {
-        println!("  Gas (direct):  ~{:.6} MATIC", gas_spent);
-    }
 
     Ok(())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-async fn try_relayer(
-    client: &RelayClient,
-    tx: &Transaction,
-    description: &str,
-) -> polymarket_relayer::Result<String> {
-    let handle = client
-        .execute(vec![tx.clone()], &format!("Redeem: {}", description))
-        .await?;
-    let tx_id = handle.id().to_string();
-    let result = handle.wait().await?;
-    Ok(result.tx_hash.unwrap_or(tx_id))
-}
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
